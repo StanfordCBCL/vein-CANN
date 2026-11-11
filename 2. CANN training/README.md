@@ -14,7 +14,7 @@ The implementation is a single Python script, organized into these components:
 
 | Component | Main functions/classes | Role |
 | --- | --- | --- |
-| Data loading and preparation | `processInput`, `getStressStretch`, `processCleanCsvInput`, `_standardize_clean_csv` | Read Excel measurements and calculate stresses/stretches, or load processed CSV curves. |
+| Data loading and preparation | `processInput`, `getStressStretch` | Read Excel measurements and geometry, then calculate stresses and mid-wall stretches. |
 | Protocol split and identifiers | `split_train_val`, `encode_curve_ids` | Assemble training/validation arrays and map protocol names to integer curve IDs. |
 | Strain-energy candidate library | `SingleInvNet`, `I8Net`, `StrainBasisNet`, `StrainEnergyCANN_single_network` | Combine invariant and Green-strain candidates into one shared energy function, `Psi_single`, through the `wx2` layer. |
 | Fiber geometry and recruitment | `H_Layer_kappas`, `FiberRecruitmentLayer` | Handle fiber directions, dispersion, recruitment distributions, branch-aware shifts, and optional curve offsets. |
@@ -27,11 +27,11 @@ The shared energy network uses `I1`, `I2`, `I4f`, `I4s`, `I4el`, `I4smc`, `I8fs`
 
 ## 2. Inputs and input structure
 
-Use passive inflation biaxial test data. `PD` denotes pressure-diameter protocols; `FL` denotes force-length protocols. Raw `.mat` files must be converted before fitting.
+Use passive inflation biaxial test data. `PD` denotes pressure-diameter protocols; `FL` denotes force-length protocols. Excel is the only supported training input. Raw `.mat` files must be converted to Excel before fitting.
 
 ### Processed Excel input
 
-Select `--input_mode excel --sample_file <workbook.xlsx>`. One sample is stored per workbook, with sheets named exactly `FL` and `PD`.
+Select the workbook with `--sample_file <workbook.xlsx>`. One sample is stored per workbook, with sheets named exactly `FL` and `PD`.
 
 | Column | Units / meaning | Requirement |
 | --- | --- | --- |
@@ -49,35 +49,17 @@ The original data documentation also lists `Axial_Stretch`; the current script d
 
 Default Excel training labels are `invivo-5%`, `invivo`, `invivo+5%` for PD and `p10`, `p60`, `p100`, `p140` for FL. Override them with `--pd_train_protocols` and `--fl_train_protocols`; remaining protocols become validation data. The default selection trains on all seven conventional protocols.
 
-### Processed curve-level CSV input
+### Mid-wall stretch calculation
 
-Select `--input_mode clean_csv --clean_data_root <sample_folder>`. `csv` and `veinsdf` are aliases for the same loader. Files are discovered recursively; point to one specimen's folder to avoid pooling specimens.
+`neural_net.py` calculates stresses and stretches from the workbook before fitting. Circumferential stretch follows Ferruzzi et al. (2013), Eq. (4):
 
 ```text
-sample_folder/
-├── sample_fl10.csv
-├── sample_fl60.csv
-├── sample_fl100.csv
-├── sample_fl140.csv
-├── sample_pd95.csv
-├── sample_pd100.csv
-└── sample_pd105.csv
+lambda_theta = (loaded_inner_radius + loaded_wall_thickness / 2)
+             / (unloaded_inner_radius + unloaded_wall_thickness / 2)
+lambda_z = loaded_length / unloaded_length
 ```
 
-Filenames containing `_pd` or beginning with `pd` are classified as PD; those containing `_fl` or beginning with `fl` are FL. Each row is one measurement point.
-
-| Field | Accepted column names (case-insensitive) | Required for |
-| --- | --- | --- |
-| Circumferential stretch | `lambda_theta`, `lambdaq`, `lambda_q`, `lambda_circ` | PD and FL |
-| Axial stretch | `lambda_z`, `lambdaz`, `lambda_axial` | PD and FL |
-| Circumferential stress, kPa | `sigma_theta_kPa`, `sigma_theta`, `tqq`, `stress_theta_kpa` | PD |
-| Axial stress, kPa | `sigma_z_kPa`, `sigma_z`, `tzz`, `stress_z_kpa` | FL |
-| Protocol identifier | `source_curve` | Optional; otherwise the filename stem is used |
-| Unloaded geometry, mm | `unloaded_od_mm`, `unloaded_h_mm`, `unloaded_length_mm` | Needed for `--objective obj6` |
-
-Stretches are dimensionless. `source_curve` and the unloaded geometry column names must use the spelling shown above. Other measurement columns may be present, but the CSV loader retains only the standardized stretches, branch stress, protocol ID, and recognized unloaded geometry. Non-numeric, complex, or non-finite values in required stretch/stress fields are dropped.
-
-CSV mode uses every discovered protocol for training and overrides the protocol-selection options; it does not create a held-out validation set. Both branches are expected unless `--allow_pd_only on` or `--allow_fl_only on` is supplied. A single-branch fit does not constrain the missing stress response.
+All radius and thickness values are expressed in the same units before taking the ratio. This uses the loaded/unloaded mid-wall radius, consistently for FL and PD. See [Ferruzzi et al. (2013)](https://doi.org/10.1007/s10439-013-0799-1).
 
 ### Internal model input/output arrays
 
@@ -87,19 +69,17 @@ For each branch, the script builds `X` with shape `(N, 2)` in the order `[lambda
 
 The original README specifies Python, TensorFlow, NumPy, pandas, scikit-learn, matplotlib, and openpyxl, with an `environment.yml` for environment creation. Jugular vein 106 is included in `1. Sample data and pre-processing/sample data`; the environment file has not yet been copied into this repository. The script currently disables GPU visibility and uses the CPU.
 
-Run from the repository root. Supply explicit input and output paths: the script's built-in data paths refer to legacy folders next to the script, which are absent here. The following jugular vein 106 example reuses the settings from the original VeinCANN README and points to the included CSV files:
+Run from the repository root. By default, `--sample_file` points to the included jugular 106 workbook relative to the script; the `SAMPLE_FILE` environment variable can override it. Supply explicit input and output paths for a reproducible run. The example below adapts the original jugular 106 settings to Excel input and mid-wall stretch; it has not been validated as a reproduction of the previous fit:
 
 ```bash
 python "2. CANN training/neural_net.py" \
-  --input_mode clean_csv \
-  --clean_data_root "1. Sample data and pre-processing/sample data" \
+  --sample_file "1. Sample data and pre-processing/sample data/JV_VG_106_19Jun20_unloading_data.xlsx" \
   --path_root "4. Evaluation/Fitted_results" \
-  --filename jugular_106 \
+  --filename jugular_106_midwall \
   --report_label jugular_106 \
   --objective stress \
   --training_mode normal \
-  --epochs 6200 \
-  --batch_size 32 \
+  --epochs 6200 --batch_size 32 \
   --recruit_preset medium --recruit_dist lognormal \
   --recruit_shift on --shift_mode inverse \
   --per_curve_recruit on --curve_offset_max 0.30 --curve_offset_l2 5e-4 \
@@ -116,14 +96,7 @@ python "2. CANN training/neural_net.py" \
   --n_restarts 5 --seed 125
 ```
 
-To use the included Excel workbook instead, replace `--input_mode clean_csv --clean_data_root ...` with:
-
-```bash
---input_mode excel \
---sample_file "1. Sample data and pre-processing/sample data/JV_VG_106_19Jun20_unloading_data.xlsx"
-```
-
-Relative paths are resolved from the working directory where the command is run. For a quick test run, reduce `--epochs` and `--n_restarts`. See the [sample data and pre-processing README](../1.%20Sample%20data%20and%20pre-processing/README.md) for raw-data conversion and format differences.
+Relative command-line paths are resolved from the working directory where the command is run. For a quick test run, reduce `--epochs` and `--n_restarts`. See the [sample data and pre-processing README](../1.%20Sample%20data%20and%20pre-processing/README.md) for raw-data conversion.
 
 ## 3. Hyperparameters and run options
 
@@ -140,9 +113,7 @@ The reference below lists the options accepted by `parse_args`, including I/O an
 
 | Option | Default | Meaning / choices |
 | --- | --- | --- |
-| `--input_mode` | `clean_csv (INPUT_MODE env override)` | Source format for the loaded sample. Choices: excel, clean_csv, csv, veinsdf. |
-| `--sample_file` | `SAMPLE_FILE env or legacy Excel path` | Excel sample file (used when --input_mode=excel). |
-| `--clean_data_root` | `CLEAN_DATA_ROOT env or legacy CSV path` | Root folder containing preprocessed PD/FL CSVs. |
+| `--sample_file` | `Included jugular 106 workbook (SAMPLE_FILE env override)` | Excel workbook with FL and PD sheets. |
 | `--path_root` | `Legacy output directory (override --path_root)` | Root directory for run outputs. |
 | `--filename` | `'VeinCANN_combined_SingleSample'` | Run sub-folder name. |
 | `--folder_name` | `None` | Inner folder name (defaults to autogenerated with epochs/batch/pen). |
@@ -255,13 +226,6 @@ The reference below lists the options accepted by `parse_args`, including I/O an
 | `--early_stop_patience` | `1000` | Epochs of no improvement before EarlyStopping restores best weights. |
 | `--n_restarts` | `1` | Number of independent restarts (best by val_loss when available, otherwise by training weighted loss). |
 
-### Single-branch data
-
-| Option | Default | Meaning / choices |
-| --- | --- | --- |
-| `--allow_pd_only` | `'off'` | Allow datasets containing only PD curves (no FL). Choices: on, off. |
-| `--allow_fl_only` | `'off'` | Allow datasets containing only FL curves (no PD). Choices: on, off. |
-
 ### Warm start and fine-tuning
 
 | Option | Default | Meaning / choices |
@@ -272,34 +236,7 @@ The reference below lists the options accepted by `parse_args`, including I/O an
 
 ## 4. Output structure
 
-Each run creates a results folder under the selected `--path_root` and `--filename`:
-
-```text
-<path_root>/<filename>/<folder_name>/
-├── raw_circumferential.pdf / .png
-├── raw_axial.pdf / .png
-└── all/
-    ├── metrics.txt
-    ├── fit_metrics.csv
-    ├── final_equation.txt
-    ├── trained_weights.txt
-    ├── final_weights.weights.h5
-    ├── curve_vocabulary.json
-    ├── Plot_loss_joint_all.pdf
-    ├── Training_circumferential.pdf / .png
-    ├── Training_axial.pdf / .png
-    ├── publication_figure.pdf / .png
-    ├── publication_figure_2.pdf / .png
-    ├── per_curve_metrics.csv
-    ├── shape_metrics.csv
-    ├── aic_bic.csv
-    ├── term_importance.csv
-    ├── active_terms.csv
-    ├── learned_recruitment.csv
-    ├── learned_curve_offsets.csv
-    ├── recruitment_curves.pdf / .png
-    └── recruitment_combined.pdf / .png
-```
+Each run saves results under `<path_root>/<filename>/<folder_name>/all/`, with raw-data plots in the parent run folder.
 
 Use `--folder_name` to set the inner run folder explicitly. Otherwise it is generated as `single_network_obj6_train_<epochs>_<batch_size>_<reg><pen>_poly<poly_n_terms>_scale-<strain_basis_scale>_all_protocols_train`. The literal `obj6` in that generated name is used even for other objectives. Use distinct run names or folder names to keep results from separate runs.
 
@@ -324,6 +261,6 @@ Key outputs (adapted from the original README):
 | `aic_bic.csv` | Training-set AIC/BIC, residual sums, observation counts, and effective parameter counts for pooled and individual branches. |
 | `recruitment_curves.*`, `recruitment_combined.*` | Recruitment plots for enabled recruitment layers. |
 
-The tree shows typical outputs from a trained run. Branch-specific plots require that branch's data; `Validation_circumferential.*` and/or `Validation_axial.*` are added when held-out protocols exist. Recruitment reports/plots require recruitment to be enabled, and checkpoint/figure saving is subject to the script's export handlers.
+Branch-specific plots require that branch's data; `Validation_circumferential.*` and/or `Validation_axial.*` are added when held-out protocols exist. Recruitment reports/plots require recruitment to be enabled, and checkpoint/figure saving is subject to the script's export handlers.
 
-With compatible load columns (normally Excel input), the script also writes headerless `CANNmodel_<filename>_loads_Pd.xlsx`, `_loads_Fl.xlsx`, `_stress_Pd.xlsx`, and `_stress_Fl.xlsx` for legacy plotting. The current clean-CSV loader does not retain those loaded geometry/load columns, so these Excel exports are skipped for that input mode. The core stress fits, metrics, and equation reports remain available.
+The script also writes headerless `CANNmodel_<filename>_loads_Pd.xlsx`, `_loads_Fl.xlsx`, `_stress_Pd.xlsx`, and `_stress_Fl.xlsx` for legacy plotting when the required load columns are available.

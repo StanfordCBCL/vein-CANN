@@ -1,31 +1,21 @@
-# Vein_polynom_4fiber_w_log_i8_v4_robust.py
-# v4 of the single-network Vein CANN. Derived from the v3 obj6 single-network code.
-# Keeps the same single shared Psi (invariant + Green-strain candidate library, with
-# I8 treated specially: 5 polynomial/exp terms, no xlog because I8 can be negative).
-# All v3 defaults are preserved unless new --v4 flags are set, so the co-worker
-# workflow remains backwards compatible.
+# VeinCANN: hyperelastic constitutive model discovery for venous tissue.
 #
-# What is new in v4 (relative to v3):
-#   1. --recruit_preset early|medium|late|custom   (sane recruitment basins)
-#   2. --recruit_dist beta|lognormal               (shifted truncated lognormal option)
-#   3. --recruit_shift on|off + --shift_mode       (branch-aware lambda_lb shift; for
-#      the PD branch the recruitment onset shifts with the held lambda_z, for the FL
-#      branch with the held lambda_theta -- mirrors Base_Poly_new_updated.py)
-#   4. --per_curve_recruit on|off                  (per-curve bounded delta_lb offsets)
-#   5. --curve_weighting equal|point + --robust    (Huber/Charbonnier; equal weight
-#      per physical PD/FL protocol regardless of point density)
-#   6. tail weighting: --theta_tail_gain/_power/_stretch and z variants
-#   7. --training_mode normal|curriculum|curriculum_prune_refit
-#      (Phase 1: stable terms only / Phase 2: full library / Phase 3: prune + refit)
-#   8. --n_restarts                                (best by val loss; falls back to train)
-#   9. Post-training shape diagnostics (negative-slope count, min slope, roughness)
-#  10. Extended CSV outputs: per_curve_metrics, shape_metrics, learned_recruitment,
-#      learned_curve_offsets, term_importance, active_terms.
+# Input: an Excel workbook with FL (force-length) and PD (pressure-diameter)
+# sheets containing experimental measurements and unloaded specimen geometry.
+# Stresses and mid-wall stretches are calculated before fitting.
 #
-# Architecturally unchanged: SingleInvNet (7 terms with xlog), I8Net (5 terms, no
-# xlog), StrainBasisNet, H_Layer_kappas with kappa dispersion, FiberRecruitmentLayer
-# wrapper, the single wx2 layer combining invariant and strain candidates, and the
-# obj6 reconstructed-load objective. Pytorch was deliberately not used.
+# Model: one shared strain-energy function combining invariant-based candidates
+# and Green-strain polynomial terms. Fiber families include trainable helical
+# directions, dispersion, and optional recruitment with per-curve offsets.
+# The I8 cross-fiber subnet omits logarithmic terms because I8 can be negative.
+#
+# Training supports stress or reconstructed-load objectives, robust residuals,
+# curve and tail weighting, learning-rate schedules, independent restarts,
+# curriculum training, pruning/refitting, and checkpoint-based fine-tuning.
+#
+# Outputs include the fitted energy equation, model weights, fit metrics,
+# recruitment parameters, diagnostic tables, and stress-stretch figures.
+# See README.md in this folder for input requirements and command-line options.
 
 #%% Load Python Packages
 import matplotlib.pyplot as plt
@@ -50,166 +40,23 @@ import matplotlib.colors as mcolors
 print('Numpy: ' + np.__version__)
 print('Tensorflow: ' + tf.__version__)
 
-# %% Path to single sample data file
-# Defaults to the local cleaned Lexus file next to this script. Override with:
-# SAMPLE_FILE=/path/to/unloading_data_Animal_cleaned.xlsx python Vein_polynom_4fiber_w_log_i8_v3.py
+# %% Excel sample data (override with --sample_file or SAMPLE_FILE).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SAMPLE_FILE = os.environ.get(
     "SAMPLE_FILE",
     os.path.join(
-        SCRIPT_DIR,
-        "Marisa_vein_samples",
-        "Sheep_vein_mat_cleaned",
-        "unloading_data_Lexus_cleaned.xlsx",
+        SCRIPT_DIR, "..", "1. Sample data and pre-processing", "sample data",
+        "JV_VG_106_19Jun20_unloading_data.xlsx",
     ),
 )
-CLEAN_DATA_ROOT = os.environ.get(
-    "CLEAN_DATA_ROOT",
-    os.path.join(
-        SCRIPT_DIR,
-        "Marisa_vein_samples",
-        "Preprocessed",
-        "Gus",
-    ),
-)
-INPUT_MODE = os.environ.get("INPUT_MODE", "clean_csv").lower()
 DEFAULT_SEED = int(os.environ.get("FIT_SEED", "45"))
-
-def _first_existing_col(df, names):
-    col_map = {str(c).lower(): c for c in df.columns}
-    for name in names:
-        if name in df.columns:
-            return name
-        key = str(name).lower()
-        if key in col_map:
-            return col_map[key]
-    return None
-
-def _standardize_clean_csv(df, curve_kind, source_name):
-    lam_theta_col = _first_existing_col(df, ["lambda_theta", "lambdaq", "lambda_q", "lambda_circ"])
-    lam_z_col = _first_existing_col(df, ["lambda_z", "lambdaz", "lambda_axial"])
-    if curve_kind == "pd":
-        stress_col = _first_existing_col(df, ["sigma_theta_kpa", "sigma_theta", "tqq", "stress_theta_kpa"])
-    else:
-        stress_col = _first_existing_col(df, ["sigma_z_kpa", "sigma_z", "tzz", "stress_z_kpa"])
-    missing = [
-        label for label, col in (
-            ("lambda_theta", lam_theta_col),
-            ("lambda_z", lam_z_col),
-            ("stress", stress_col),
-        ) if col is None
-    ]
-    if missing:
-        raise ValueError(f"{source_name} is missing required clean CSV columns: {missing}")
-
-    # Use pd.to_numeric(errors='coerce') instead of .astype(float) so MATLAB-
-    # style complex strings like '0.29+0.03i' become NaN and the dropna() call
-    # below filters them out, rather than raising. This protects against the
-    # known artifact where MATLAB preprocessing returns complex inner radii when
-    # the volume-conservation sqrt argument goes negative (e.g. Seven_fl10.csv).
-    out = pd.DataFrame({
-        "lambda_theta": pd.to_numeric(df[lam_theta_col], errors="coerce"),
-        "lambda_z": pd.to_numeric(df[lam_z_col], errors="coerce"),
-        "test_case": df["source_curve"].astype(str) if "source_curve" in df.columns else source_name,
-    })
-    if curve_kind == "pd":
-        out["sigma_theta"] = pd.to_numeric(df[stress_col], errors="coerce")
-    else:
-        out["sigma_z"] = pd.to_numeric(df[stress_col], errors="coerce")
-
-    for src, dst in [
-        ("unloaded_od_mm", "OD"),
-        ("unloaded_h_mm", "H"),
-        ("unloaded_length_mm", "L"),
-    ]:
-        if src in df.columns:
-            out[dst] = pd.to_numeric(df[src], errors="coerce")
-
-    n_in = len(out)
-    stress_col_name = "sigma_theta" if curve_kind == "pd" else "sigma_z"
-    out = out.replace([np.inf, -np.inf], np.nan).dropna(
-        subset=["lambda_theta", "lambda_z", stress_col_name]
-    )
-    n_dropped = n_in - len(out)
-    if n_dropped > 0:
-        print(
-            f"  [{source_name}] dropped {n_dropped}/{n_in} rows with non-finite "
-            f"or complex values (likely MATLAB preprocessing artifacts)"
-        )
-    return out
-
-def processCleanCsvInput(data_root, allow_pd_only=False, allow_fl_only=False):
-    """
-    Load already-clean VeinSDF CSV data. Expected layout can be either:
-    data_root/*.csv or data_root/<animal>/*.csv.
-
-    v4: pass allow_pd_only=True for PD-only datasets (e.g. Staccato TEVG).
-    Pass allow_fl_only=True for FL-only datasets. The missing branch is
-    returned as an empty DataFrame with the standardized schema so all
-    downstream guards on len(X) > 0 still work.
-    """
-    print("\n" + "="*60)
-    print("LOADING CLEAN VEINSDF CSV DATA")
-    print("="*60)
-    root = os.path.abspath(data_root)
-    if not os.path.isdir(root):
-        raise FileNotFoundError(f"CLEAN_DATA_ROOT does not exist or is not a directory: {root}")
-
-    csv_files = []
-    for cur_root, _, files in os.walk(root):
-        for name in files:
-            if name.lower().endswith(".csv") and "_pre_enrichment_backups" not in cur_root:
-                csv_files.append(os.path.join(cur_root, name))
-
-    pd_frames = []
-    fl_frames = []
-    for path in sorted(csv_files):
-        lower = os.path.basename(path).lower()
-        if "_pd" in lower or lower.startswith("pd"):
-            df = pd.read_csv(path)
-            pd_frames.append(_standardize_clean_csv(df, "pd", os.path.splitext(os.path.basename(path))[0]))
-        elif "_fl" in lower or lower.startswith("fl"):
-            df = pd.read_csv(path)
-            fl_frames.append(_standardize_clean_csv(df, "fl", os.path.splitext(os.path.basename(path))[0]))
-
-    # v4 relaxed validation: require at least one PD or FL frame; allow PD-only
-    # or FL-only via flags.
-    if not pd_frames and not fl_frames:
-        raise ValueError(f"Could not find any PD or FL clean CSV files under: {root}")
-    if not pd_frames and not allow_fl_only:
-        raise ValueError(
-            f"No PD clean CSV files found under {root}. "
-            "Pass --allow_fl_only on to fit FL-only data."
-        )
-    if not fl_frames and not allow_pd_only:
-        raise ValueError(
-            f"No FL clean CSV files found under {root}. "
-            "Pass --allow_pd_only on to fit PD-only data."
-        )
-
-    if pd_frames:
-        Pd = pd.concat(pd_frames, ignore_index=True)
-    else:
-        Pd = pd.DataFrame(columns=["lambda_theta", "lambda_z", "sigma_theta", "test_case"])
-    if fl_frames:
-        Fl = pd.concat(fl_frames, ignore_index=True)
-    else:
-        Fl = pd.DataFrame(columns=["lambda_theta", "lambda_z", "sigma_z", "test_case"])
-    print(f"Loaded clean PD curves: {len(pd_frames)} files, {len(Pd)} rows")
-    print(f"Loaded clean FL curves: {len(fl_frames)} files, {len(Fl)} rows")
-    if len(Pd):
-        print(f"  PD protocols: {sorted(Pd['test_case'].unique())}")
-    if len(Fl):
-        print(f"  FL protocols: {sorted(Fl['test_case'].unique())}")
-    print("="*60 + "\n")
-    return Fl, Pd
 
 def _geometry_column_as_mm(df, col):
     values = pd.to_numeric(df[col], errors="coerce").dropna().to_numpy(dtype=float)
     if values.size == 0:
         raise ValueError(f"obj6 geometry column {col!r} has no finite values.")
     value = float(np.nanmedian(values))
-    # Excel inputs keep OD/H in microns; clean CSV geometry columns are already mm.
+    # Excel inputs store OD/H in microns and L in mm.
     if value > 20.0:
         value *= 1e-3
     return value
@@ -219,8 +66,7 @@ def infer_obj6_reference_geometry(Pd, Fl):
     if missing:
         raise ValueError(
             "obj6 requires unloaded OD/H/L geometry to reconstruct pressure and force. "
-            f"Missing columns: {missing}. For clean CSV input, include "
-            "unloaded_od_mm, unloaded_h_mm, and unloaded_length_mm."
+            f"Missing Excel geometry columns: {missing}. Include OD, H, and L."
         )
 
     source = Pd if all(col in Pd.columns for col in ("OD", "H", "L")) else Fl
@@ -776,7 +622,7 @@ def getStressStretch(Pd, Fl):
     Fl["sigma_theta"] = (Fl["Pressure_kPa"] * Fl["ir"]) / Fl["h"]
     Pd["sigma_theta"] = (Pd["Pressure_kPa"] * Pd["ir"]) / Pd["h"]
     
-    # Circumferential stretch (mid-wall)
+    # Circumferential stretch at mid-wall: Ferruzzi et al. (2013), Eq. (4).
     Fl["lambda_theta"] = (Fl["ir"] + Fl["h"] / 2) / (Fl["IR"] + 1e-3 * Fl["H"] / 2)
     Pd["lambda_theta"] = (Pd["ir"] + Pd["h"] / 2) / (Pd["IR"] + 1e-3 * Pd["H"] / 2)
     
@@ -3399,7 +3245,7 @@ def save_model_predictions_for_plotting(model_nn, Fl, Pd, save_folder, prefix="C
     missing_fl = [c for c in required_cols if c not in Fl.columns]
     if missing_pd or missing_fl:
         print(
-            "Skipping save_model_predictions_for_plotting: clean-CSV input lacks "
+            "Skipping save_model_predictions_for_plotting: input lacks "
             f"load columns (Pd missing {missing_pd}, Fl missing {missing_fl})."
         )
         return
@@ -3687,13 +3533,8 @@ def parse_args(argv=None):
     )
 
     # --- I/O ---
-    p.add_argument("--input_mode", choices=["excel", "clean_csv", "csv", "veinsdf"],
-                   default=INPUT_MODE,
-                   help="Source format for the loaded sample.")
     p.add_argument("--sample_file", default=SAMPLE_FILE,
-                   help="Excel sample file (used when --input_mode=excel).")
-    p.add_argument("--clean_data_root", default=CLEAN_DATA_ROOT,
-                   help="Root folder containing preprocessed PD/FL CSVs.")
+                   help="Excel workbook with FL and PD sheets (the only supported input format).")
     p.add_argument("--path_root",
                    default="./Vein_i8_v3_results/results_single_sample_i8_obj6_single_network_Lexus/",
                    help="Root directory for run outputs.")
@@ -3743,7 +3584,7 @@ def parse_args(argv=None):
     p.add_argument("--lr_min", type=float, default=1e-5,
                    help="Lower bound on the learning rate (plateau / cosine).")
 
-    # --- Protocol splits (ignored for clean_csv: all curves are used) ---
+    # --- Excel protocol splits ---
     p.add_argument("--pd_train_protocols", nargs="+",
                    default=["invivo-5%", "invivo", "invivo+5%"],
                    help="Test cases (PD) used for training.")
@@ -3884,15 +3725,6 @@ def parse_args(argv=None):
                    help="Number of independent restarts (best by val_loss when "
                         "available, otherwise by training weighted loss).")
 
-    # v4 PD-only / FL-only mode (e.g. Staccato has no FL test). The missing
-    # branch is treated as zero-size; FL stress is unconstrained and the helical
-    # fiber angles are effectively unidentified in PD-only mode -- they will
-    # drift to whatever the optimizer finds convenient. Use with care.
-    p.add_argument("--allow_pd_only", choices=["on", "off"], default="off",
-                   help="Allow datasets containing only PD curves (no FL).")
-    p.add_argument("--allow_fl_only", choices=["on", "off"], default="off",
-                   help="Allow datasets containing only FL curves (no PD).")
-
     # ---------------------------------------------------------------------------
     # Fine-tuning / warm start
     # ---------------------------------------------------------------------------
@@ -3976,21 +3808,9 @@ def main(argv=None):
     print(f"  output_dir: {path2saveResults_0}")
     print("="*60 + "\n")
 
-    # --- Load and process data ---
-    if args.input_mode in ("clean_csv", "csv", "veinsdf"):
-        clean_root = args.clean_data_root or os.path.join(
-            SCRIPT_DIR, "Marisa_vein_samples", "Sheep_vein_mat_cleaned"
-        )
-        Fl, Pd = processCleanCsvInput(
-            clean_root,
-            allow_pd_only=(args.allow_pd_only == "on"),
-            allow_fl_only=(args.allow_fl_only == "on"),
-        )
-        pd_train_protocols = sorted(Pd["test_case"].unique())
-        fl_train_protocols = sorted(Fl["test_case"].unique())
-    else:
-        Fl, Pd = processInput(args.sample_file)
-        getStressStretch(Pd, Fl)
+    # --- Load Excel measurements and calculate mid-wall stretches ---
+    Fl, Pd = processInput(args.sample_file)
+    getStressStretch(Pd, Fl)
 
     # obj6 needs OD/H/L geometry to reconstruct pressure and force; skip the
     # inference (and the obj6 objective itself) when geometry is missing. For
@@ -4272,8 +4092,6 @@ def main(argv=None):
         # Final-equation report (which terms survived above the threshold)
         if args.report_label:
             report_label = args.report_label
-        elif args.input_mode in ("clean_csv", "csv", "veinsdf"):
-            report_label = os.path.basename(os.path.normpath(args.clean_data_root))
         else:
             report_label = os.path.splitext(os.path.basename(args.sample_file))[0]
         save_final_equation_report(
@@ -4574,8 +4392,6 @@ def main(argv=None):
     # Title shows the animal name + per-direction R^2 values.
     if args.report_label:
         _animal_for_fig = args.report_label
-    elif args.input_mode in ("clean_csv", "csv", "veinsdf"):
-        _animal_for_fig = os.path.basename(os.path.normpath(args.clean_data_root))
     else:
         _animal_for_fig = os.path.splitext(os.path.basename(args.sample_file))[0]
     try:
