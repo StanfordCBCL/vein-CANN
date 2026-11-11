@@ -1,0 +1,329 @@
+# CANN training
+
+This folder contains `neural_net.py`, the training script for constitutive model discovery. The overview, model summary, example settings, and output descriptions below are adapted from the original VeinCANN `README.md`; input-format details also draw on its `Input_data/README.md`. Function names, accepted columns, and defaults were checked against the copied script.
+
+VeinCANN discovers hyperelastic constitutive models for venous tissue from passive inflation biaxial test data. The model fits pressure-diameter (`PD`) and force-length (`FL`) protocols and reports a strain-energy equation with fitted material response plots and diagnostics.
+
+## 1. Structure of the code
+
+- `neural_net.py` trains a constrained neural constitutive model for venous tissue.
+- The model uses stretch-based invariants, Green-strain polynomial terms, helical fiber families, and optional fiber recruitment.
+- The final output includes a discovered strain-energy equation and fitted stress-stretch/load response.
+
+The implementation is a single Python script, organized into these components:
+
+| Component | Main functions/classes | Role |
+| --- | --- | --- |
+| Data loading and preparation | `processInput`, `getStressStretch`, `processCleanCsvInput`, `_standardize_clean_csv` | Read Excel measurements and calculate stresses/stretches, or load processed CSV curves. |
+| Protocol split and identifiers | `split_train_val`, `encode_curve_ids` | Assemble training/validation arrays and map protocol names to integer curve IDs. |
+| Strain-energy candidate library | `SingleInvNet`, `I8Net`, `StrainBasisNet`, `StrainEnergyCANN_single_network` | Combine invariant and Green-strain candidates into one shared energy function, `Psi_single`, through the `wx2` layer. |
+| Fiber geometry and recruitment | `H_Layer_kappas`, `FiberRecruitmentLayer` | Handle fiber directions, dispersion, recruitment distributions, branch-aware shifts, and optional curve offsets. |
+| Stress model | `stress_calc_with_recruitment_and_poly`, `model_architecture_with_recruitment_and_poly` | Differentiate the energy function to obtain circumferential and axial stresses. |
+| Losses and training | `Compile_and_fit_joint`, `train_with_strategy` | Apply the selected objective, weighting, optimizer, learning-rate schedule, curriculum, pruning/refitting, and restarts. |
+| Reporting and evaluation | `save_final_equation_report`, `evaluate_on_dataset`, `compute_aic_bic_v4`, plotting/export helpers | Save equations, checkpoints, metrics, figures, and diagnostics. |
+| Entry point | `parse_args`, `main` | Read command-line options and coordinate the full run. |
+
+The shared energy network uses `I1`, `I2`, `I4f`, `I4s`, `I4el`, `I4smc`, `I8fs`, `E_theta`, and `E_z`. The ordinary invariant subnets each provide seven candidates; `I8Net` provides five without logarithmic terms because `I8fs` can be negative. Green-strain candidates add polynomial and, by default, linear terms.
+
+## 2. Inputs and input structure
+
+Use passive inflation biaxial test data. `PD` denotes pressure-diameter protocols; `FL` denotes force-length protocols. Raw `.mat` files must be converted before fitting.
+
+### Processed Excel input
+
+Select `--input_mode excel --sample_file <workbook.xlsx>`. One sample is stored per workbook, with sheets named exactly `FL` and `PD`.
+
+| Column | Units / meaning | Requirement |
+| --- | --- | --- |
+| `Pressure_mmHg` | Pressure, mmHg | Both sheets |
+| `Outer_Diameter_microm` | Loaded outer diameter, micrometres | Both sheets |
+| `Force_g` | Transducer force, grams | Both sheets |
+| `Loaded_Length_mm` | Loaded length, mm | Both sheets |
+| `H` | Unloaded wall thickness, micrometres | Both sheets |
+| `L` | Unloaded length, mm | Both sheets |
+| `OD` | Unloaded outer diameter, micrometres | Both sheets |
+| `test_case` | Protocol label | Both sheets |
+| `PHI` | Opening angle, degrees | Optional; absent/NaN defaults to zero |
+
+The original data documentation also lists `Axial_Stretch`; the current script derives axial stretch from `Loaded_Length_mm / L` instead. Geometry must be populated on the measurement rows used in the calculations.
+
+Default Excel training labels are `invivo-5%`, `invivo`, `invivo+5%` for PD and `p10`, `p60`, `p100`, `p140` for FL. Override them with `--pd_train_protocols` and `--fl_train_protocols`; remaining protocols become validation data. The default selection trains on all seven conventional protocols.
+
+### Processed curve-level CSV input
+
+Select `--input_mode clean_csv --clean_data_root <sample_folder>`. `csv` and `veinsdf` are aliases for the same loader. Files are discovered recursively; point to one specimen's folder to avoid pooling specimens.
+
+```text
+sample_folder/
+├── sample_fl10.csv
+├── sample_fl60.csv
+├── sample_fl100.csv
+├── sample_fl140.csv
+├── sample_pd95.csv
+├── sample_pd100.csv
+└── sample_pd105.csv
+```
+
+Filenames containing `_pd` or beginning with `pd` are classified as PD; those containing `_fl` or beginning with `fl` are FL. Each row is one measurement point.
+
+| Field | Accepted column names (case-insensitive) | Required for |
+| --- | --- | --- |
+| Circumferential stretch | `lambda_theta`, `lambdaq`, `lambda_q`, `lambda_circ` | PD and FL |
+| Axial stretch | `lambda_z`, `lambdaz`, `lambda_axial` | PD and FL |
+| Circumferential stress, kPa | `sigma_theta_kPa`, `sigma_theta`, `tqq`, `stress_theta_kpa` | PD |
+| Axial stress, kPa | `sigma_z_kPa`, `sigma_z`, `tzz`, `stress_z_kpa` | FL |
+| Protocol identifier | `source_curve` | Optional; otherwise the filename stem is used |
+| Unloaded geometry, mm | `unloaded_od_mm`, `unloaded_h_mm`, `unloaded_length_mm` | Needed for `--objective obj6` |
+
+Stretches are dimensionless. `source_curve` and the unloaded geometry column names must use the spelling shown above. Other measurement columns may be present, but the CSV loader retains only the standardized stretches, branch stress, protocol ID, and recognized unloaded geometry. Non-numeric, complex, or non-finite values in required stretch/stress fields are dropped.
+
+CSV mode uses every discovered protocol for training and overrides the protocol-selection options; it does not create a held-out validation set. Both branches are expected unless `--allow_pd_only on` or `--allow_fl_only on` is supplied. A single-branch fit does not constrain the missing stress response.
+
+### Internal model input/output arrays
+
+For each branch, the script builds `X` with shape `(N, 2)` in the order `[lambda_theta, lambda_z]`, a target stress vector of shape `(N,)`, and curve IDs. The Keras stress model receives four `(N, 1)` arrays: `[lambda_theta, lambda_z, branch_flag, curve_id]`, where the branch flag is `0` for PD and `1` for FL and curve IDs are integers. It returns normalized circumferential and axial stresses; reported physical stresses are recovered using `theta_max` and `z_max`.
+
+### Requirements and running
+
+The original README specifies Python, TensorFlow, NumPy, pandas, scikit-learn, matplotlib, and openpyxl, with an `environment.yml` for environment creation. Jugular vein 106 is included in `1. Sample data and pre-processing/sample data`; the environment file has not yet been copied into this repository. The script currently disables GPU visibility and uses the CPU.
+
+Run from the repository root. Supply explicit input and output paths: the script's built-in data paths refer to legacy folders next to the script, which are absent here. The following jugular vein 106 example reuses the settings from the original VeinCANN README and points to the included CSV files:
+
+```bash
+python "2. CANN training/neural_net.py" \
+  --input_mode clean_csv \
+  --clean_data_root "1. Sample data and pre-processing/sample data" \
+  --path_root "4. Evaluation/Fitted_results" \
+  --filename jugular_106 \
+  --report_label jugular_106 \
+  --objective stress \
+  --training_mode normal \
+  --epochs 6200 \
+  --batch_size 32 \
+  --recruit_preset medium --recruit_dist lognormal \
+  --recruit_shift on --shift_mode inverse \
+  --per_curve_recruit on --curve_offset_max 0.30 --curve_offset_l2 5e-4 \
+  --curve_weighting equal --circ_weight 2.0 \
+  --robust huber --robust_delta 0.5 \
+  --theta_tail_gain 1.0 --theta_tail_power 4.0 --theta_tail_stretch_v4 1.65 \
+  --z_tail_gain 0.0 --z_tail_power 4.0 \
+  --lr 0.01 --lr_schedule plateau --lr_patience 200 \
+  --reg L1 --pen 1e-5 \
+  --equation_thresh 1e-7 \
+  --poly_n_terms 7 \
+  --strain_basis_scale auto --nonneg_weights on \
+  --i8fs_init 0.1 \
+  --n_restarts 5 --seed 125
+```
+
+To use the included Excel workbook instead, replace `--input_mode clean_csv --clean_data_root ...` with:
+
+```bash
+--input_mode excel \
+--sample_file "1. Sample data and pre-processing/sample data/JV_VG_106_19Jun20_unloading_data.xlsx"
+```
+
+Relative paths are resolved from the working directory where the command is run. For a quick test run, reduce `--epochs` and `--n_restarts`. See the [sample data and pre-processing README](../1.%20Sample%20data%20and%20pre-processing/README.md) for raw-data conversion and format differences.
+
+## 3. Hyperparameters and run options
+
+The reference below lists the options accepted by `parse_args`, including I/O and reporting controls. Defaults are parser defaults unless noted; the example above deliberately overrides several of them. Boolean options accept `on`/`off` (also `true`/`false`); `--no_train` is a standalone flag.
+
+- `normal` trains the full library. `curriculum` trains stable/low-order candidates first, then the full library. `curriculum_prune_refit` also prunes weak terms and refits.
+- `stress` fits normalized stresses; `stress_hybrid_log` mixes stress and log-stress residuals; `obj6` fits reconstructed pressure/vessel-force residuals and requires unloaded geometry with positive `OD`, `H`, `L` and `OD > 2*H`.
+- `--recruit_preset medium` changes the effective initial threshold to `1.20`, lower-bound range to `0.90–1.60`, and upper bound to `1.90`. `early` uses `1.05`, `0.90–1.35`, `1.60`; `late` uses `1.40`, `1.00–1.90`, `2.30`. Use `custom` to retain the individually supplied bounds/threshold.
+- `--poly_n_terms 5` selects quadratic/cubic candidates; `7` adds quartics; `10` adds mixed higher-order candidates. `--poly_include_linear on` adds two linear candidates separately. `--use_poly`, `--poly_trainable`, and `--poly_regularizer` are deprecated and ignored; use `--reg`/`--pen` for shared candidate regularization.
+- `--init_from` loads compatible weights; retain `curve_vocabulary.json` with the checkpoint for curve mapping. `--freeze_pretrained on` freezes the candidate subnets and `wx2` while recruitment, offsets, angles, and dispersion remain trainable. For fine-tuning, specify learning rate, epochs, and strategy explicitly: the current `--finetune` convenience overrides are conditional on particular incoming values.
+- `--equation_thresh` controls reported active terms; `--prune_threshold` controls pruning during the prune/refit strategy. These serve different purposes.
+
+### Input and output paths
+
+| Option | Default | Meaning / choices |
+| --- | --- | --- |
+| `--input_mode` | `clean_csv (INPUT_MODE env override)` | Source format for the loaded sample. Choices: excel, clean_csv, csv, veinsdf. |
+| `--sample_file` | `SAMPLE_FILE env or legacy Excel path` | Excel sample file (used when --input_mode=excel). |
+| `--clean_data_root` | `CLEAN_DATA_ROOT env or legacy CSV path` | Root folder containing preprocessed PD/FL CSVs. |
+| `--path_root` | `Legacy output directory (override --path_root)` | Root directory for run outputs. |
+| `--filename` | `'VeinCANN_combined_SingleSample'` | Run sub-folder name. |
+| `--folder_name` | `None` | Inner folder name (defaults to autogenerated with epochs/batch/pen). |
+
+### Training and loss
+
+| Option | Default | Meaning / choices |
+| --- | --- | --- |
+| `--no_train` | `False` | Skip training (kept for symmetry; v3 only supports train=True). |
+| `--epochs` | `2000` | Epoch count for normal training. |
+| `--batch_size` | `32` | Training batch size. |
+| `--reg` | `'L1'` | Shared candidate regularization. Choices: L1, L2. |
+| `--pen` | `1e-05` | Regularization penalty. |
+| `--objective` | `'stress'` | Training objective: reconstructed pressure/force loads, direct normalized stress, or hybrid stress+log stress. Choices: obj6, stress, stress_hybrid_log. |
+| `--log_stress_scale` | `1.0` | Physical kPa scale s0 used by stress_hybrid_log: log1p(stress / s0). |
+| `--log_loss_weight` | `0.5` | Fraction of stress_hybrid_log loss assigned to the log-stress term. |
+| `--circ_weight` | `3.5` | Loss weight on the circumferential (PD) samples vs. axial (FL). |
+| `--tail_weight` | `0.0` | Extra sample-weight multiplier for high-stress/high-stretch elbow/tail points. |
+| `--tail_stress_frac` | `0.0` | Activate tail weighting once abs(stress)/max_stress exceeds this fraction (0 disables). |
+| `--theta_tail_stretch` | `0.0` | Activate circumferential tail weighting once lambda_theta exceeds this value (0 disables). |
+| `--z_tail_stretch` | `0.0` | Activate axial tail weighting once lambda_z exceeds this value (0 disables). |
+| `--tail_width` | `0.05` | Sigmoid width for smooth tail/elbow sample weighting. |
+| `--lr` | `0.01` | Adam initial learning rate. |
+| `--lr_schedule` | `'plateau'` | LR schedule: 'plateau' (ReduceLROnPlateau, adaptive), 'exponential' (decays each step), 'cosine' (CosineDecay from lr to lr_min), 'none' (constant lr). Choices: none, plateau, exponential, cosine. |
+| `--lr_decay` | `0.2` | Factor used by plateau / exponential schedules (plateau: new_lr = lr * factor; exponential: decay_rate). |
+| `--lr_patience` | `200` | Epochs without improvement before plateau drops the LR. |
+| `--lr_min` | `1e-05` | Lower bound on the learning rate (plateau / cosine). |
+
+### Protocol selection
+
+| Option | Default | Meaning / choices |
+| --- | --- | --- |
+| `--pd_train_protocols` | `['invivo-5%', 'invivo', 'invivo+5%']` | Test cases (PD) used for training. |
+| `--fl_train_protocols` | `['p10', 'p60', 'p100', 'p140']` | Test cases (FL) used for training. |
+
+### Fiber angles
+
+| Option | Default | Meaning / choices |
+| --- | --- | --- |
+| `--helical_mode` | `'independent'` | Fiber angle parameterization. 'symmetric' uses one bounded angle pair +/- alpha. Choices: independent, symmetric. |
+| `--helix_angle_init_deg` | `35.0` | Initial helical fiber angle magnitude in degrees. |
+| `--helix_angle_min_deg` | `5.0` | Minimum helical fiber angle magnitude in degrees for symmetric mode. |
+| `--helix_angle_max_deg` | `85.0` | Maximum helical fiber angle magnitude in degrees for symmetric mode. |
+| `--train_fiber_angles` | `True` | Allow helical fiber angle parameters to train (on/off). |
+
+### Recruitment
+
+| Option | Default | Meaning / choices |
+| --- | --- | --- |
+| `--recruit_preset` | `'medium'` | Shorthand to set init_threshold + lb/ub bounds together. early=(1.05, 0.90-1.35, ub=1.60), medium=(1.20, 0.90-1.60, ub=1.90), late=(1.40, 1.00-1.90, ub=2.30). Overrides --init_threshold and --recruit_lb_min/_max/_ub_max unless set to 'custom'. Choices: early, medium, late, custom. |
+| `--init_threshold` | `1.4` | Initial lambda_lb for FiberRecruitmentLayer. Only used when --recruit_preset custom; ignored otherwise (preset overwrites it). |
+| `--init_sharpness` | `5.0` | Initial sharpness (tau) of the softplus recruitment transition. |
+| `--recruit_lb_min` | `0.9` | Hard lower bound for learned lambda_lb. Only used when --recruit_preset custom; ignored otherwise. |
+| `--recruit_lb_max` | `2.0` | Hard upper bound for learned lambda_lb. Only used when --recruit_preset custom; ignored otherwise. |
+| `--recruit_ub_max` | `2.3` | Hard upper bound for learned lambda_ub. Only used when --recruit_preset custom; ignored otherwise. |
+| `--use_recruitment` | `True` | Enable the FiberRecruitmentLayer (on/off). |
+| `--recruit_dist` | `'lognormal'` | Slack-stretch distribution across the fiber population: beta (compact support, flexible shape) or shifted truncated lognormal (right-skewed, harder floor at lambda_lb). Choices: beta, lognormal. |
+| `--recruit_shift` | `'on'` | Enable branch-aware lambda_lb shift driven by the held companion stretch (PD samples shift with lambda_z, FL with lambda_theta). Choices: on, off. |
+| `--shift_mode` | `'inverse'` | When --recruit_shift on: 'direct' = lambda_lb * companion/ref (higher companion → later recruitment), 'inverse' = lambda_lb * ref/companion (higher companion → earlier recruitment). Choices: direct, inverse. |
+| `--per_curve_recruit` | `'on'` | Enable per-curve learned bounded lambda_lb offsets. Choices: on, off. |
+| `--curve_offset_max` | `0.3` | Max absolute delta lambda_lb per curve when --per_curve_recruit on. |
+| `--curve_offset_l2` | `0.0005` | L2 regularizer on the raw per-curve offset weights. |
+
+### Strain-energy candidates
+
+| Option | Default | Meaning / choices |
+| --- | --- | --- |
+| `--use_poly` | `True` | Deprecated compatibility flag. Ignored: Green-strain candidates are always part of the single shared network. |
+| `--poly_n_terms` | `7` | Number of polynomial basis terms. Choices: 5, 7, 10. |
+| `--poly_trainable` | `True` | Deprecated compatibility flag. Ignored: strain candidates are always trainable through the shared network. |
+| `--poly_regularizer` | `0.001` | Deprecated compatibility flag. Ignored: use --reg/--pen for shared candidate regularization. |
+| `--poly_include_linear` | `True` | Add linear E_theta and E_z basis terms to the polynomial layer (on/off). Linear I4f/I4s/I4el/I4smc terms already exist as the first weight per family inside each SingleInvNet, so they are always trainable. |
+| `--strain_basis_scale` | `'auto'` | Scale Green-strain basis columns before the shared wx2 layer. 'auto' divides each strain candidate by its training max-abs value. Choices: auto, none. |
+| `--strain_scale_floor` | `1e-06` | Minimum denominator for auto strain-basis scaling. |
+| `--nonneg_weights` | `True` | Constrain invariant-subnet, I8fs, W_ANN, and polynomial weights to be >= 0 (on/off). |
+| `--i8fs_init` | `0.1` | Initial value for I8fs quadratic and exp-quadratic cross-fiber terms. |
+
+### Reproducibility and reporting
+
+| Option | Default | Meaning / choices |
+| --- | --- | --- |
+| `--seed` | `45 (FIT_SEED env override)` | Random seed for repeatable initialization. |
+| `--verbose` | `1` | Keras fit verbosity: 0=silent, 1=progress bar, 2=one line per epoch. Choices: 0, 1, 2. |
+| `--equation_thresh` | `0.001` | Absolute effective-weight threshold for listing a term as surviving in the final-equation report. |
+| `--report_label` | `None` | Label used in the final-equation report title (defaults to the data source folder/file name). |
+
+### Curve weighting and robust residuals
+
+| Option | Default | Meaning / choices |
+| --- | --- | --- |
+| `--curve_weighting` | `'point'` | 'equal' = each physical PD/FL curve contributes equally; 'point' = each sample contributes equally (v3 default). Choices: equal, point. |
+| `--robust` | `'mse'` | Residual kernel for the stress/obj6 objective. Choices: mse, huber, charbonnier. |
+| `--robust_delta` | `0.5` | Huber transition / Charbonnier eps stand-in. |
+| `--theta_tail_gain` | `2.0` | Polynomial tail gain on PD residuals: w *= 1 + gain * max(lambda_theta - theta_tail_stretch, 0)^power. |
+| `--theta_tail_power` | `4.0` | PD polynomial-tail exponent. |
+| `--theta_tail_stretch_v4` | `None` | Deprecated alias for the v4 polynomial PD tail onset. If set, overrides --theta_tail_stretch for the polynomial tail only. |
+| `--z_tail_gain` | `1.5` | FL polynomial-tail gain. |
+| `--z_tail_power` | `4.0` | FL polynomial-tail exponent. |
+| `--z_tail_stretch_v4` | `1.4` | Deprecated alias for the v4 polynomial FL tail onset. If set, overrides --z_tail_stretch for the polynomial tail only. |
+
+### Training strategy and restarts
+
+| Option | Default | Meaning / choices |
+| --- | --- | --- |
+| `--training_mode` | `'normal'` | Training strategy. curriculum: low-order terms only first, then full library. curriculum_prune_refit: also prunes weak terms and refits. Choices: normal, curriculum, curriculum_prune_refit. |
+| `--epochs_phase1` | `1500` | Stable/low-order phase epoch count. |
+| `--epochs_phase2` | `3000` | Full-library phase epoch count. |
+| `--epochs_refit` | `1000` | Pruned-library refit epoch count. |
+| `--prune_threshold` | `0.001` | Effective abs(w_sub * w_ann) (scaled by mean abs(basis)) below which a candidate is zeroed at the start of phase 3. |
+| `--early_stop_patience` | `1000` | Epochs of no improvement before EarlyStopping restores best weights. |
+| `--n_restarts` | `1` | Number of independent restarts (best by val_loss when available, otherwise by training weighted loss). |
+
+### Single-branch data
+
+| Option | Default | Meaning / choices |
+| --- | --- | --- |
+| `--allow_pd_only` | `'off'` | Allow datasets containing only PD curves (no FL). Choices: on, off. |
+| `--allow_fl_only` | `'off'` | Allow datasets containing only FL curves (no PD). Choices: on, off. |
+
+### Warm start and fine-tuning
+
+| Option | Default | Meaning / choices |
+| --- | --- | --- |
+| `--init_from` | `None` | Path to a final_weights.h5 file produced by a prior run. Loaded before training; enables warm-start fine-tuning. |
+| `--freeze_pretrained` | `'off'` | When --init_from is set: freeze the invariant subnet weights (w*_*) and the final wx2 layer. Recruitment, per-curve offsets, helix angles, and kappa stay trainable. Choices: on, off. |
+| `--finetune` | `'off'` | Convenience flag: when on, sets sensible fine-tune defaults (lr=1e-3, n_restarts=1, training_mode=normal, epochs=500) unless the user explicitly overrode them. Choices: on, off. |
+
+## 4. Output structure
+
+Each run creates a results folder under the selected `--path_root` and `--filename`:
+
+```text
+<path_root>/<filename>/<folder_name>/
+├── raw_circumferential.pdf / .png
+├── raw_axial.pdf / .png
+└── all/
+    ├── metrics.txt
+    ├── fit_metrics.csv
+    ├── final_equation.txt
+    ├── trained_weights.txt
+    ├── final_weights.weights.h5
+    ├── curve_vocabulary.json
+    ├── Plot_loss_joint_all.pdf
+    ├── Training_circumferential.pdf / .png
+    ├── Training_axial.pdf / .png
+    ├── publication_figure.pdf / .png
+    ├── publication_figure_2.pdf / .png
+    ├── per_curve_metrics.csv
+    ├── shape_metrics.csv
+    ├── aic_bic.csv
+    ├── term_importance.csv
+    ├── active_terms.csv
+    ├── learned_recruitment.csv
+    ├── learned_curve_offsets.csv
+    ├── recruitment_curves.pdf / .png
+    └── recruitment_combined.pdf / .png
+```
+
+Use `--folder_name` to set the inner run folder explicitly. Otherwise it is generated as `single_network_obj6_train_<epochs>_<batch_size>_<reg><pen>_poly<poly_n_terms>_scale-<strain_basis_scale>_all_protocols_train`. The literal `obj6` in that generated name is used even for other objectives. Use distinct run names or folder names to keep results from separate runs.
+
+Key outputs (adapted from the original README):
+
+| File(s) | Contents |
+| --- | --- |
+| `metrics.txt` | Readable summary of hyperparameters, training protocols, fit metrics, and AIC/BIC. |
+| `fit_metrics.csv` | One-row table of the main fit metrics and selected AIC/BIC values. |
+| `final_equation.txt` | Discovered strain-energy equation terms above the reporting threshold. |
+| `trained_weights.txt` | Fitted model weights in readable form. |
+| `final_weights.weights.h5` | Saved Keras weights for warm-start or fine-tuning; falls back to `final_weights.h5` for older Keras if needed. |
+| `curve_vocabulary.json` | Ordered protocol names associated with integer curve IDs; saved alongside the checkpoint. |
+| `Training_circumferential.*`, `Training_axial.*` | Model fit plots for PD and FL data. |
+| `publication_figure.*`, `publication_figure_2.*` | Combined publication-style fit figures; the second uses protocol colors and a legend. |
+| `Plot_loss_joint_all.pdf` | Training-loss history. |
+| `per_curve_metrics.csv` | Training-curve branch, curve ID, point count, R², and RMSE. |
+| `term_importance.csv`, `active_terms.csv` | Candidate term importance and the subset meeting `equation_thresh`. |
+| `learned_recruitment.csv` | Per-family recruitment bounds, distribution parameters, transition sharpness, and reference stretches. |
+| `learned_curve_offsets.csv` | Per-curve/per-family recruitment offsets; empty when offsets are disabled. |
+| `shape_metrics.csv` | Post-fit shape diagnostics, including slope and roughness measures. |
+| `aic_bic.csv` | Training-set AIC/BIC, residual sums, observation counts, and effective parameter counts for pooled and individual branches. |
+| `recruitment_curves.*`, `recruitment_combined.*` | Recruitment plots for enabled recruitment layers. |
+
+The tree shows typical outputs from a trained run. Branch-specific plots require that branch's data; `Validation_circumferential.*` and/or `Validation_axial.*` are added when held-out protocols exist. Recruitment reports/plots require recruitment to be enabled, and checkpoint/figure saving is subject to the script's export handlers.
+
+With compatible load columns (normally Excel input), the script also writes headerless `CANNmodel_<filename>_loads_Pd.xlsx`, `_loads_Fl.xlsx`, `_stress_Pd.xlsx`, and `_stress_Fl.xlsx` for legacy plotting. The current clean-CSV loader does not retain those loaded geometry/load columns, so these Excel exports are skipped for that input mode. The core stress fits, metrics, and equation reports remain available.
