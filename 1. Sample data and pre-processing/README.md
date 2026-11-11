@@ -4,48 +4,16 @@ This folder contains the jugular vein 106 example, its raw measurements, process
 
 ## What is included
 
-```text
-1. Sample data and pre-processing/
-├── README.md
-├── sample data/
-│   ├── JV_VG_106_19Jun20_Fl.mat
-│   ├── JV_VG_106_19Jun20_Pd.mat
-│   ├── JV_VG_106_19Jun20_unloading_data.xlsx
-│   ├── 106_fl10.csv
-│   ├── 106_fl60.csv
-│   ├── 106_fl100.csv
-│   ├── 106_fl140.csv
-│   ├── 106_pd95.csv
-│   ├── 106_pd100.csv
-│   └── 106_pd105.csv
-└── Data_processing_scripts/
-    ├── split_mat_to_excel.py
-    ├── combined_mat_to_excel.py
-    ├── input_data_processing_ivc.py
-    └── mat_to_csv/
-        ├── combined_mat_to_curve_csv.m
-        ├── compute_fl_stress_stretch.m
-        └── compute_pd_stress_stretch.m
-```
+The `sample data` folder contains experimental data for jugular vein 106 and a processed Excel workbook:
 
-`FL` denotes force-length tests and `PD` pressure-diameter tests. The MAT files contain separate FL and PD measurements for the same specimen. The Excel workbook and seven curve-level CSV files are already processed inputs accepted by `neural_net.py`; raw MAT files cannot be passed directly to training.
+| Format | Contents | Use |
+| --- | --- | --- |
+| MATLAB (`.mat`) | Experimental measurements and specimen geometry in separate force-length (FL) and pressure-diameter (PD) files. | Convert the pair to Excel before training. |
+| Excel (`.xlsx`) | One workbook with `FL` and `PD` sheets containing measurements and specimen geometry. | Load directly into `neural_net.py`, which calculates stresses and mid-wall stretches before fitting. |
 
-## Use the processed data directly
+The raw files are `JV_VG_106_19Jun20_Fl.mat` and `JV_VG_106_19Jun20_Pd.mat`; the included processed workbook is `JV_VG_106_19Jun20_unloading_data.xlsx`. The `Data_processing_scripts` folder contains the Python MAT-to-Excel converters.
 
-No conversion is required to train with the included workbook or CSVs. Run commands from the repository root, with the training dependencies installed. For a short CSV trial:
-
-```bash
-python "2. CANN training/neural_net.py" \
-  --input_mode clean_csv \
-  --clean_data_root "1. Sample data and pre-processing/sample data" \
-  --path_root "4. Evaluation/Fitted_results" \
-  --filename jugular_106_trial \
-  --report_label jugular_106 \
-  --objective stress \
-  --epochs 100 --n_restarts 1
-```
-
-The loader selects PD/FL CSV filenames and ignores the MAT and Excel files in the same folder. This trial checks the training workflow; use the full settings in the [CANN training README](../2.%20CANN%20training/README.md) for the documented jugular 106 fit. That README also lists dependencies, hyperparameters, and outputs.
+The included workbook is ready for training. See the [CANN training README](../2.%20CANN%20training/README.md) for training commands, dependencies, hyperparameters, and outputs.
 
 ## Regenerate Excel from the raw MAT pair
 
@@ -71,7 +39,7 @@ python -m pip install scipy pandas openpyxl
 
 3. Read the printed output path. The script creates `OUTPUT_DIR` and writes `<sample_name>_unloading_data.xlsx`; it derives `sample_name` from the FL file's `name` field when present, otherwise from its filename with the trailing `_Fl` removed. The separate `reprocessed` folder keeps the included workbook intact.
 
-4. Train with the resulting workbook using `--input_mode excel --sample_file "<printed output path>"`. Provide `--path_root` and `--filename` as in the example above.
+4. Open the resulting workbook and confirm that it contains `FL` and `PD` sheets with the columns and protocol labels listed below.
 
 The copied script still contains its original hard-coded paths until you change them. It has no command-line path arguments; passing filenames after the script name does not configure the conversion.
 
@@ -96,43 +64,18 @@ It copies unloaded geometry `H`, `L`, `OD`, and `PHI` from each file onto the co
 | `test3` | `p100` | `invivo+5%` |
 | `test4` | `p140` | — |
 
-The result is one workbook with `FL` and `PD` sheets. Missing test fields are reported and skipped. Stress/stretch calculations happen later in `neural_net.py`: it converts pressure and force units, reconstructs loaded inner geometry under constant wall volume, adds the pressure contribution to vessel force, and computes stresses and stretches.
+The result is one workbook with `FL` and `PD` sheets. Missing test fields are reported and skipped. The workbook stores measurements and geometry; stresses and mid-wall stretches are calculated later by the training script.
 
-## CSV processing and the MATLAB scripts
-
-The seven included CSVs are ready for `--input_mode clean_csv`. Each file represents one protocol and contains these columns:
-
-| Columns | Meaning / units |
-| --- | --- |
-| `lambda_theta`, `lambda_z` | Circumferential and axial stretches, dimensionless |
-| `sigma_theta_kPa`, `sigma_z_kPa` | Circumferential and axial stresses, kPa |
-| `pressure_kPa` | Pressure, kPa |
-| `od_mm`, `length_mm` | Loaded outer diameter and length, mm |
-| `F_transducer_mN`, `F_vessel_mN` | Measured and pressure-corrected vessel force, mN |
-
-The copied `mat_to_csv/combined_mat_to_curve_csv.m` is a MATLAB batch exporter for **combined** MAT structures containing geometry plus both `biaxial_Pd` and `biaxial_Fl` in one measurement block. It does not directly accept the included split MAT pair. There is no split-pair-to-CSV driver among the copied scripts; use the supplied CSVs or the split-pair-to-Excel workflow above for this sample.
-
-For a compatible combined input, the batch script requires editing its `specimens` list and output location, keeping `analysis = '2D'`, and making both helper functions available on the MATLAB path. It uses PD tags `[-5, 0, 5]` and FL tags `[10, 60, 100, 140]`, then exports one CSV per protocol and combined PD/FL plots. Its default output folder is `out` under MATLAB's working directory.
-
-The helpers assume raw `H`, `OD`, and loaded diameter are in **mm**, while the split Excel converter labels the corresponding diameter/thickness values as **micrometres** without rescaling them. The MATLAB helpers also use outer-radius circumferential stretch, whereas Excel training computes mid-wall circumferential stretch. Treat these as separate processing routes; they are not guaranteed to regenerate numerically identical stress/stretch curves.
-
-The MATLAB exporter writes the nine columns above but does not add `unloaded_od_mm`, `unloaded_h_mm`, or `unloaded_length_mm`. Those additional unloaded-geometry columns are needed for `--objective obj6`; use `--objective stress` with the included CSVs.
-
-## Role of each copied script
+## Role of each pre-processing script
 
 | Script | Purpose and use here |
 | --- | --- |
 | `split_mat_to_excel.py` | Convert the jugular 106 split MAT pair to one Excel workbook; configure paths before running. |
-| `combined_mat_to_excel.py` | Legacy combined-MAT converter with hard-coded input/output paths; not the route for the included split pair. |
-| `input_data_processing_ivc.py` | Combined-MAT converter with command-line paths and explicit mm-to-micrometre conversion; not the route for the included split pair. |
-| `mat_to_csv/combined_mat_to_curve_csv.m` | Batch export compatible combined MAT data to protocol CSVs and plots; requires path/specimen configuration. |
-| `mat_to_csv/compute_fl_stress_stretch.m` | MATLAB helper for FL geometry, stress, and stretch. |
-| `mat_to_csv/compute_pd_stress_stretch.m` | MATLAB helper for PD geometry, stress, and stretch. |
+| `combined_mat_to_excel.py` | Legacy combined-MAT-to-Excel converter with hard-coded input/output paths; not the route for the included split pair. |
+| `input_data_processing_ivc.py` | Combined-MAT-to-Excel converter with command-line paths and explicit mm-to-micrometre conversion; not the route for the included split pair. |
 
-## Check the processed inputs
+## Check the processed workbook
 
 - Confirm the workbook has `FL` and `PD` sheets and the columns/units described above. Geometry should be positive, with unloaded `OD > 2*H`.
-- Confirm protocol labels match the Excel training selection. In CSV mode, all discovered protocol curves are used for training.
-- Check stresses and stretches for non-finite or complex values. The CSV loader drops invalid required entries and reports the number dropped; the Excel converter does not clean them.
-- Inspect stress-stretch curves and the number of retained points. The current MATLAB PD helper filters points with reconstructed inner-diameter-squared below `1` (in its mm-based units); account for that filter when comparing processing routes.
-- Keep regenerated CSVs in a separate folder and point training to that folder. CSV discovery is recursive, so keeping duplicate curves beneath the selected data root would include both copies.
+- Confirm each measurement row has the appropriate `test_case` label from the table above.
+- Check measurement columns for missing or non-finite values. The Excel converter organizes measurements without cleaning them.
