@@ -22,7 +22,8 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import numpy as np
 import tensorflow as tf
-tf.config.set_visible_devices([], 'GPU')
+# Use only the available CPU devices for all TensorFlow operations.
+tf.config.set_visible_devices(tf.config.list_physical_devices("CPU"))
 import tensorflow.keras.backend as K
 import tensorflow.keras as keras
 import pickle
